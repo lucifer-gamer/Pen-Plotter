@@ -272,7 +272,8 @@ class SynthesisNetwork(jit.ScriptModule):
             mixture = self.squeeze(mixture)
             x_temp = self.get_mean_prediction(mixture, stochastic=stochastic).unsqueeze(0)
 
-            if self._is_end_of_string(phi, u, x_temp):
+            min_steps = max(80, int(u) * 20)
+            if t > min_steps and self._is_end_of_string(phi, u, x_temp):
                 x_temp[0, 2] = 1.0
                 outputs.append(x_temp)
                 break
@@ -285,7 +286,8 @@ class SynthesisNetwork(jit.ScriptModule):
     def _is_end_of_string(self, phi, string_length, x_temp):
         last_phi = phi[0, 0, string_length - 1]
         is_eos = x_temp[0, 2] > 0.5
-        return last_phi > 0.8 or (phi[0, 0].argmax() == string_length - 1 and is_eos)
+        # Require an actual pen-lift to terminate
+        return is_eos and (last_phi > 0.8 or phi[0, 0].argmax() == string_length - 1)
 
     def squeeze(self, mixture: Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]):
         pi, mu, sd, ro, eos = mixture

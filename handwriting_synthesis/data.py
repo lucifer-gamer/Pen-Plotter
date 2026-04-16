@@ -1,6 +1,5 @@
 import re
 from collections import defaultdict
-import h5py
 import numpy as np
 import torch
 import torch.utils.data
