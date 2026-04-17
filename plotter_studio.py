@@ -13,7 +13,7 @@
 # === CRITICAL IMPORT ORDER: PyTorch FIRST, then PyQt6 ===
 import torch
 from handwriting_synthesis.sampling import HandwritingSynthesizer as CoreSynthesizer
-from handwriting_synthesis.stroke_reviewer import StrokeReviewer
+from handwriting_synthesis.stroke_reviewer_v4 import StrokeReviewer
 
 import sys
 import os
