@@ -7,18 +7,24 @@ Extends the v3 weighted sub-score engine with text-aware heuristics:
   * Ascender / descender topology validation
   * Ink-density pooling detector (stuck-pen / attention-loop)
 
-All six original v3 sub-scores are preserved. Two new sub-scores are
-added (topology + density), and weights are rebalanced.
+Architecture:
+  The six original V3 sub-scores are preserved with IDENTICAL weights.
+  Topology and density are applied as MULTIPLICATIVE PENALTIES on top
+  of the core V3 score.  They can only REDUCE a score, never inflate it.
+  This preserves V3's proven detection sensitivity while catching NEW
+  failure modes (missing descenders, stuck-pen loops).
 
-Sub-score weights (must sum to 1.0):
-  arc_score      0.22  — stroke arc-length relative to expectation
-  x_mono_score   0.14  — left-to-right monotonicity
-  extrema_score  0.18  — vertical direction changes per char (legibility)
-  stroke_score   0.08  — stroke-count plausibility
-  width_score    0.08  — bounding-box width sanity
-  height_score   0.06  — bounding-box height sanity
-  topology_score 0.16  — ascender/descender shape validation  [NEW]
-  density_score  0.08  — ink-pooling / stuck-pen detection     [NEW]
+Core weights (V3-identical, sum to 1.0):
+  arc_score      0.28  — stroke arc-length relative to expectation
+  x_mono_score   0.18  — left-to-right monotonicity
+  extrema_score  0.24  — vertical direction changes per char (legibility)
+  stroke_score   0.10  — stroke-count plausibility
+  width_score    0.12  — bounding-box width sanity (now proportional)
+  height_score   0.08  — bounding-box height sanity
+
+Multiplicative penalties (applied after core score):
+  topology  — ascender/descender shape validation  [NEW]
+  density   — ink-pooling / stuck-pen detection     [NEW]
 
 No external API calls, no GPU needed — runs in milliseconds per chunk.
 """
@@ -57,20 +63,21 @@ for _c in WIDE_CHARS:
 
 
 # ---------------------------------------------------------------------------
-# Scoring weights (must sum to 1.0)
+# Core scoring weights — IDENTICAL to V3 (must sum to 1.0)
 # ---------------------------------------------------------------------------
 
 WEIGHTS: dict[str, float] = {
-    "arc":      0.22,
-    "x_mono":   0.14,
-    "extrema":  0.18,
-    "strokes":  0.08,
-    "width":    0.08,
-    "height":   0.06,
-    "topology": 0.16,   # NEW
-    "density":  0.08,   # NEW
+    "arc":     0.28,
+    "x_mono":  0.18,
+    "extrema": 0.24,
+    "strokes": 0.10,
+    "width":   0.12,
+    "height":  0.08,
 }
 assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9, f"Weights must sum to 1.0, got {sum(WEIGHTS.values())}"
+
+# Multiplicative penalty keys (not additive — these only reduce the core score)
+PENALTY_KEYS = ("topology", "density")
 
 
 # ---------------------------------------------------------------------------
@@ -536,57 +543,59 @@ def _height_sub_score(h: float, median_height: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Aggregate chunk score  (v4 — with topology and density)
+# Aggregate chunk score  (v4 — V3 core + multiplicative penalties)
 # ---------------------------------------------------------------------------
 
 def score_chunk(text: str, strokes: list, bbox: tuple, stats: BlockStats) -> float:
     """
     Return a quality score in [0.0, 1.0] for a single synthesized chunk.
-    V4: uses 8 weighted sub-scores including text-aware topology and density.
+
+    V4 architecture:
+      1. Compute V3 core score from 6 weighted sub-scores (identical to v3).
+      2. Compute topology and density as penalty multipliers [0..1].
+      3. Final = core_score × topology × density.
+
+    This means topology and density can only REDUCE a score, never inflate it.
+    A perfect chunk scores exactly like V3.  A chunk with missing descenders
+    or pooled ink gets aggressively penalised on top.
     """
     if not strokes:
         return 0.0
 
     char_count = max(1, len(text.strip()))
 
-    # 1. Arc length
+    # --- V3 core sub-scores (identical weights) ---
     arc = _arc_length(strokes)
     expected_arc = stats.expected_arc(text)
     arc_s = _arc_sub_score(arc, expected_arc)
 
-    # 2. X-monotonicity
     mono = _x_monotonicity(strokes)
     mono_s = _x_mono_sub_score(mono, stats.median_x_mono)
 
-    # 3. Y-extrema (adaptive hysteresis)
     hysteresis = max(0.4, stats.median_height * 0.12 + 0.02 * char_count)
     extrema_count = _y_extrema(strokes, hysteresis)
     ext_pc = extrema_count / char_count
     ext_s = _extrema_sub_score(ext_pc)
 
-    # 4. Stroke count
     min_exp, max_exp = stats.expected_strokes(text)
     strk_s = _strokes_sub_score(len(strokes), min_exp, max_exp)
 
-    # 5. Width (now text-aware proportional)
     w = bbox[2] - bbox[0]
     expected_w = max(stats.expected_width(text), char_count * BlockStats.MIN_CHAR_WIDTH)
     w_s = _width_sub_score(w, expected_w)
 
-    # 6. Height
     h = bbox[3] - bbox[1]
     h_s = _height_sub_score(h, stats.median_height)
 
-    # 7. Topology (NEW — ascender/descender validation)
-    topo_s = _topology_analysis(text, strokes, bbox, stats.median_height)
+    core_scores = [arc_s, mono_s, ext_s, strk_s, w_s, h_s]
+    core_weights = list(WEIGHTS.values())
+    core_score = sum(s * wt for s, wt in zip(core_scores, core_weights))
 
-    # 8. Ink density (NEW — stuck-pen detection)
+    # --- V4 multiplicative penalties ---
+    topo_s = _topology_analysis(text, strokes, bbox, stats.median_height)
     dens_s = _ink_density_score(strokes, bbox)
 
-    sub_scores = [arc_s, mono_s, ext_s, strk_s, w_s, h_s, topo_s, dens_s]
-    weights    = list(WEIGHTS.values())
-
-    final = sum(s * w for s, w in zip(sub_scores, weights))
+    final = core_score * topo_s * dens_s
     return max(0.0, min(1.0, final))
 
 
@@ -594,11 +603,13 @@ def score_chunk_detailed(
     text: str, strokes: list, bbox: tuple, stats: BlockStats
 ) -> tuple[float, dict]:
     """
-    Same as score_chunk but also returns a dict of sub-score breakdown
-    for display in the debug panel.
+    Same as score_chunk but also returns a dict of sub-score breakdown.
+    Returns (final_score, subs_dict) where subs_dict includes both
+    core sub-scores and penalty multipliers.
     """
+    ALL_KEYS = list(WEIGHTS.keys()) + list(PENALTY_KEYS)
     if not strokes:
-        return 0.0, {k: 0.0 for k in WEIGHTS}
+        return 0.0, {k: 0.0 for k in ALL_KEYS}
 
     char_count = max(1, len(text.strip()))
 
@@ -627,10 +638,17 @@ def score_chunk_detailed(
     topo_s = _topology_analysis(text, strokes, bbox, stats.median_height)
     dens_s = _ink_density_score(strokes, bbox)
 
-    subs = dict(zip(WEIGHTS.keys(),
-                    [arc_s, mono_s, ext_s, strk_s, w_s, h_s, topo_s, dens_s]))
-    weights = list(WEIGHTS.values())
-    final = sum(s * wt for s, wt in zip(subs.values(), weights))
+    # Build sub-scores dict (core + penalties)
+    subs = {}
+    for key, val in zip(WEIGHTS.keys(), [arc_s, mono_s, ext_s, strk_s, w_s, h_s]):
+        subs[key] = val
+    subs["topology"] = topo_s
+    subs["density"] = dens_s
+
+    # Core score (V3-identical)
+    core_score = sum(subs[k] * WEIGHTS[k] for k in WEIGHTS)
+    # Multiplicative penalties
+    final = core_score * topo_s * dens_s
     final = max(0.0, min(1.0, final))
     return final, subs
 
@@ -740,10 +758,10 @@ class StrokeReviewer:
         _log(f"[OK]   Ref char-w  : {stats.median_char_width:.2f}mm  │  "
              f"Ref height: {stats.median_height:.2f}mm  │  "
              f"Ref x-mono: {stats.median_x_mono:.2f}")
-        _log(f"[OK]   Weights: arc={WEIGHTS['arc']:.2f} x_mono={WEIGHTS['x_mono']:.2f} "
+        _log(f"[OK]   Core weights (V3): arc={WEIGHTS['arc']:.2f} x_mono={WEIGHTS['x_mono']:.2f} "
              f"ext={WEIGHTS['extrema']:.2f} strk={WEIGHTS['strokes']:.2f} "
-             f"w={WEIGHTS['width']:.2f} h={WEIGHTS['height']:.2f} "
-             f"topo={WEIGHTS['topology']:.2f} dens={WEIGHTS['density']:.2f}")
+             f"w={WEIGHTS['width']:.2f} h={WEIGHTS['height']:.2f}")
+        _log(f"[OK]   Penalties (×mul): topology + density")
 
         # Parse 4-tuples (backward compat for 3-tuples)
         improved = []
