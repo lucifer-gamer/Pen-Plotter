@@ -217,9 +217,14 @@ class SynthesisEngine:
             all_y = [y for s in strokes for x, y in s]
             return max(all_y) if all_y else 0.0
 
-        # Sort and pick the median to robustly ignore outliers (like deep descenders)
+        # Use the 65th-percentile instead of median (50th).
+        # This sits just above the true ink baseline, safely below descender
+        # outliers while still capturing where the majority of letter-bottom
+        # points cluster.  More stable across different stroke densities.
         bottom_points.sort()
-        return bottom_points[len(bottom_points) // 2]
+        idx65 = int(len(bottom_points) * 0.65)
+        idx65 = min(idx65, len(bottom_points) - 1)
+        return bottom_points[idx65]
 
     @staticmethod
     def _dp_simplify_stroke(stroke: list, epsilon: float = 0.15) -> list:
@@ -924,7 +929,7 @@ class HandwritingBlock(QGraphicsItem):
         act_prop = menu.addAction("Block Properties...")
         menu.addSeparator()
         act_del = menu.addAction("Delete")
-        
+
         action = menu.exec(event.screenPos())
         if action == act_edit:
             self.signals.edit_requested.emit(self)
@@ -935,54 +940,101 @@ class HandwritingBlock(QGraphicsItem):
         elif action == act_prop:
             dlg = BlockPropertiesDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                self.bias = dlg.slider_bias.value()
-                self.scale_param = dlg.slider_scale.value()
-                self.block_width = dlg.slider_width.value()
-                self.re_layout()
-                self.update()
-                # Regenerate to apply bias/scale changes fully
-                self.signals.regenerate_requested.emit(self)
+                props = dlg.get_props()
+                need_regen = (
+                    abs(props['scale'] - self.scale_param) > 0.0001
+                )
+                self.scale_param = props['scale']
+                self.block_width = props['width']
+                self.line_spacing = props['line_spacing']
+                self.word_spacing = props['word_spacing']
+                if need_regen:
+                    self.signals.regenerate_requested.emit(self)
+                else:
+                    self.re_layout()
+                    self.update()
         event.accept()
 
-    def get_strokes_in_scene(self) -> list:
-        """Return strokes offset by this item's scene position."""
-        pos = self.scenePos()
-        offset_strokes = []
-        
+
+    # ---- Static helpers -------------------------------------------------------
     @staticmethod
-    def _tokenize(text: str) -> list[str]:
+    def _tokenize(text: str, min_chunk_chars: int = 8) -> list:
+        """
+        Smart phrase-level tokenizer.
+
+        Groups words into phrases until the running character count reaches
+        min_chunk_chars, ensuring the RNN always receives enough context to
+        generate well-formed cursive strokes.
+
+        Leftover handling:
+          - If the leftover phrase has >= min_chunk_chars/2 chars  it is
+            emitted as its own chunk (avoids giant merged tokens).
+          - Only truly tiny remainders (< min_chunk_chars/2) are merged
+            backward into the preceding token.
+
+        Newlines are preserved as '\\n' sentinels for line-break layout.
+        Maximum chunk growth is capped at min_chunk_chars * 3 to prevent
+        runaway merges on very short-word text.
+        """
+        MAX_CHUNK_MULTIPLIER = 3
+
         tokens = []
         for line in text.split('\n'):
-            for word in line.split():
-                if word.strip():
-                    tokens.append(word)
+            words = [w for w in line.split() if w.strip()]
+            if not words:
+                tokens.append('\n')
+                continue
+
+            chunk_words: list[str] = []
+            chunk_chars: int = 0
+
+            for word in words:
+                # Count only the alphabetic core for length estimate
+                core = word.strip('.,;:!?\'"()[]{}–—“”‘’')
+                core_len = max(1, len(core))
+
+                chunk_words.append(word)
+                chunk_chars += core_len
+
+                # Flush when chunk is long enough or hitting hard cap
+                if (chunk_chars >= min_chunk_chars or
+                        chunk_chars >= min_chunk_chars * MAX_CHUNK_MULTIPLIER):
+                    tokens.append(' '.join(chunk_words))
+                    chunk_words = []
+                    chunk_chars = 0
+
+            # Flush remaining words
+            if chunk_words:
+                leftover = ' '.join(chunk_words)
+                leftover_chars = chunk_chars
+                tiny_threshold = max(4, min_chunk_chars // 2)
+
+                if leftover_chars < tiny_threshold:
+                    # Small remainder: merge backward to avoid a tiny tail chunk
+                    for idx in range(len(tokens) - 1, -1, -1):
+                        if tokens[idx] != '\n':
+                            # Only merge if resulting chunk won't exceed cap
+                            merged_len = len(tokens[idx].replace(' ', '')) + leftover_chars
+                            if merged_len <= min_chunk_chars * MAX_CHUNK_MULTIPLIER:
+                                tokens[idx] += ' ' + leftover
+                                break
+                    else:
+                        tokens.append(leftover)
+                else:
+                    # Independently emit — it has enough chars to synthesize cleanly
+                    tokens.append(leftover)
+
             tokens.append('\n')
-        if tokens and tokens[-1] == '\n':
+
+        # Remove trailing newline sentinel
+        while tokens and tokens[-1] == '\n':
             tokens.pop()
         return tokens
 
     @staticmethod
-    def _split_punctuation(word: str) -> tuple[str, str, str]:
-        import string
-        leading = ""
-        trailing = ""
-        core = word
-        while core and core[0] in string.punctuation:
-            leading += core[0]
-            core = core[1:]
-        while core and core[-1] in string.punctuation:
-            trailing = core[-1] + trailing
-            core = core[:-1]
-        return leading, core, trailing
-        for stroke in self._strokes:
-            offset_strokes.append([(x + pos.x(), y + pos.y()) for x, y in stroke])
-        return offset_strokes
-
-    # ---- Synthesis ------------------------------------------------------------
-    @staticmethod
     def _split_punctuation(token: str) -> tuple:
         """Split leading/trailing punctuation from a word token.
-        Returns (leading, core, trailing)."""
+        Returns (leading, core, trailing). Uses the module-level PUNCT_CHARS set."""
         leading = ""
         trailing = ""
         core = token
@@ -1160,79 +1212,14 @@ class HandwritingBlock(QGraphicsItem):
             ]:
                 painter.drawEllipse(QPointF(cx, cy), dot_r, dot_r)
 
-    # ---- Events --------------------------------------------------------------
-
-
-
-    def mousePressEvent(self, event):
-        self._drag_start_pos = self.scenePos()
-        if event.pos().x() > getattr(self, 'block_width', 170.0) - 8:
-            self._resizing = True
-            self._drag_start_x = event.scenePos().x()
-            self._drag_start_w = getattr(self, 'block_width', 170.0)
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if hasattr(self, '_resizing') and self._resizing:
-            dx = event.scenePos().x() - getattr(self, '_drag_start_x', 0)
-            self.block_width = max(30.0, getattr(self, '_drag_start_w', 170) + dx)
-            if hasattr(self, 're_layout'):
-                self.re_layout()
-            self.update()
-            scene = self.scene()
-            if scene:
-                views = scene.views()
-                if views and hasattr(views[0].parent(), 'slider_blk_width'):
-                    views[0].parent().slider_blk_width.set_value(self.block_width)
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if hasattr(self, '_resizing') and self._resizing:
-            self._resizing = False
-            event.accept()
-            return
-
-        old_pos = getattr(self, '_drag_start_pos', None)
-        new_pos = self.scenePos()
-        super().mouseReleaseEvent(event)
-
-        if old_pos is not None and old_pos != new_pos:
-            scene = self.scene()
-            if scene:
-                views = scene.views()
-                if views and hasattr(views[0].parent(), 'undo_stack'):
-                    views[0].parent().undo_stack.push(MoveBlockCommand(self, old_pos, new_pos))
-
-    def contextMenuEvent(self, event):
-        from PyQt6.QtWidgets import QMenu
-        menu = QMenu()
-        act_edit = menu.addAction("Edit Text")
-        act_regen = menu.addAction("Regenerate")
-        menu.addSeparator()
-        act_del = menu.addAction("Delete")
-        
-        action = menu.exec(event.screenPos())
-        if action == act_edit:
-            self.signals.edit_requested.emit(self)
-        elif action == act_regen:
-            self.signals.regenerate_requested.emit(self)
-        elif action == act_del:
-            self.signals.delete_requested.emit(self)
-        event.accept()
+    # ---- Events (definitive set) ---------------------------------------------
 
     def get_strokes_in_scene(self) -> list:
-        strokes = []
+        """Return strokes translated to scene coordinates."""
         origin = self.scenePos()
-        if hasattr(self, '_strokes') and self._strokes:
-            for s in self._strokes:
-                mapped_s = []
-                for px, py in s:
-                    mapped_s.append((px + origin.x(), py + origin.y()))
-                strokes.append(mapped_s)
+        strokes = []
+        for s in self._strokes:
+            strokes.append([(px + origin.x(), py + origin.y()) for px, py in s])
         return strokes
 
 
@@ -1296,12 +1283,63 @@ class DecimalSlider(QWidget):
     def value(self) -> float:
         return self.slider.value() / self.multiplier
 
-RETRY_COLORS = [
-    ("#1e1e1e", "clean"),
-    ("#ffcc00", "1 retry"),
-    ("#ff8800", "2 retries"),
-    ("#cc0000", "3+ retries"),
-]
+    def set_value(self, val: float):
+        """Programmatically set the slider value (used by block resize handle)."""
+        clamped = int(max(self.slider.minimum(), min(self.slider.maximum(),
+                         round(val * self.multiplier))))
+        self.slider.setValue(clamped)
+
+class BlockPropertiesDialog(QDialog):
+    """Per-block style override dialog (right-click → Block Properties)."""
+    def __init__(self, block, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Block Properties")
+        self.setMinimumWidth(360)
+        self.setStyleSheet("""
+            QDialog { background-color: #252526; }
+            QLabel  { color: #cccccc; font-size: 12px; }
+            QPushButton {
+                background-color: #0e639c; color: white; border: none;
+                padding: 7px 18px; font-weight: bold; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #1177bb; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.addWidget(QLabel(f"Properties for block: \"{block.source_text[:40]}...\""
+                                if len(block.source_text) > 40
+                                else f"Properties for block: \"{block.source_text}\""))
+
+        self.slider_scale = DecimalSlider(
+            "Text Scale", 0.005, 0.100, block.scale_param, decimals=3)
+        self.slider_width = DecimalSlider(
+            "Block Width (mm)", 30.0, 300.0, block.block_width, decimals=1)
+        self.slider_spacing = DecimalSlider(
+            "Line Spacing (mm)", 2.0, 60.0, block.line_spacing, decimals=2)
+        self.slider_word = DecimalSlider(
+            "Word Spacing (mm)", 1.0, 20.0, block.word_spacing, decimals=1)
+
+        for sldr in (self.slider_scale, self.slider_width,
+                     self.slider_spacing, self.slider_word):
+            layout.addWidget(sldr)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_props(self) -> dict:
+        return {
+            'scale':        self.slider_scale.value(),
+            'width':        self.slider_width.value(),
+            'line_spacing': self.slider_spacing.value(),
+            'word_spacing': self.slider_word.value(),
+        }
+
 
 class ReviewPanel(QDockWidget):
     def __init__(self, parent=None):
@@ -1335,6 +1373,10 @@ class ReviewPanel(QDockWidget):
             legend_row.addWidget(sw)
         legend_row.addStretch()
 
+        copy_btn = QPushButton("📋 Copy Log")
+        copy_btn.setStyleSheet("background-color: #3e3e42; color: #d4d4d4; border-radius: 3px; padding: 4px 12px;")
+        copy_btn.clicked.connect(self.copy_to_clipboard)
+
         clear_btn = QPushButton("Clear")
         clear_btn.setStyleSheet("background-color: #3e3e42; color: #d4d4d4; border-radius: 3px; padding: 4px 15px;")
         clear_btn.clicked.connect(self.clear)
@@ -1343,6 +1385,7 @@ class ReviewPanel(QDockWidget):
         toolbar.addWidget(self._avg_retries_label)
         toolbar.addLayout(legend_row)
         toolbar.addStretch()
+        toolbar.addWidget(copy_btn)
         toolbar.addWidget(clear_btn)
         layout.addLayout(toolbar)
 
@@ -1400,6 +1443,33 @@ class ReviewPanel(QDockWidget):
         self._avg_retries_label.setText("Avg Retries: 0.0")
         self._log_edit.clear()
 
+    def copy_to_clipboard(self):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._log_edit.toPlainText())
+
+
+# ---------------------------------------------------------------------------
+# Style presets
+# Keys: bias, scale, line_spacing, word_spacing, min_chunk, threshold, retries
+#
+# Design notes:
+#   - Neat uses bias=0.75 (not 0.50).  bias<0.75 makes stochastic sampling
+#     unreliable: the MDN stays flat so sampling occasionally hits degenerate
+#     mixture components.  0.75 is the sweet spot for clean + stable strokes.
+#   - threshold decreases as style gets looser because legitimate Casual/Loose
+#     strokes have lower X-monotonicity and wider arcs (which the scorer
+#     would incorrectly penalise at Normal thresholds).
+#   - retries decrease as style gets looser because the scorer is more lenient.
+# ---------------------------------------------------------------------------
+STYLE_PRESETS: dict[str, dict] = {
+    "✏️ Neat":    dict(bias=0.75, scale=0.012, line_spacing=8.0,  word_spacing=3.5, min_chunk=12, threshold=0.65, retries=6),
+    "📝 Normal":  dict(bias=1.00, scale=0.015, line_spacing=10.0, word_spacing=5.0, min_chunk=8,  threshold=0.60, retries=4),
+    "🗒️ Casual":  dict(bias=1.40, scale=0.017, line_spacing=11.0, word_spacing=5.5, min_chunk=7,  threshold=0.50, retries=3),
+    "✍️ Loose":   dict(bias=1.80, scale=0.019, line_spacing=12.0, word_spacing=6.5, min_chunk=6,  threshold=0.45, retries=3),
+    "🌀 Sloppy":  dict(bias=2.00, scale=0.022, line_spacing=14.0, word_spacing=7.0, min_chunk=5,  threshold=0.40, retries=2),
+}
+
+
 class PlotterStudio(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1407,13 +1477,33 @@ class PlotterStudio(QMainWindow):
         self.resize(1600, 950)
 
         self.engine = SynthesisEngine()
-        
         self._blocks = []
         self.undo_stack = QUndoStack(self)
 
         self._apply_global_style()
         self._build_menu()
         self._build_ui()
+
+    def _apply_preset(self, name: str):
+        """Apply a named style preset to all sidebar sliders and AI review settings."""
+        p = STYLE_PRESETS.get(name)
+        if not p:
+            return
+        self.slider_bias.set_value(p['bias'])
+        self.slider_scale.set_value(p['scale'])
+        self.slider_spacing.set_value(p['line_spacing'])
+        self.slider_word.set_value(p['word_spacing'])
+        self.slider_min_chunk.set_value(float(p['min_chunk']))
+        # Also tune the AI reviewer for this style
+        if 'threshold' in p:
+            self.slider_quality.set_value(p['threshold'])
+        if 'retries' in p:
+            self.spin_max_retries.setValue(p['retries'])
+        self.statusBar().showMessage(
+            f"Preset '{name}' applied — bias={p['bias']}, threshold={p.get('threshold','?')}, "
+            f"retries={p.get('retries','?')}, min_chunk={p['min_chunk']}",
+            5000
+        )
 
     def _apply_global_style(self):
         self.setStyleSheet('''
@@ -1430,20 +1520,40 @@ class PlotterStudio(QMainWindow):
     def _build_menu(self):
         menu = self.menuBar()
         file_menu = menu.addMenu("File")
-        
+
         add_act = QAction("Add Text Block...", self)
+        add_act.setShortcut("Ctrl+N")
         add_act.triggered.connect(self._on_add_block)
         file_menu.addAction(add_act)
         file_menu.addSeparator()
 
         open_act = QAction("Open Session...", self)
+        open_act.setShortcut("Ctrl+O")
+        open_act.triggered.connect(self._on_open_session)
+        file_menu.addAction(open_act)
+
         save_act = QAction("Save Session...", self)
-        file_menu.addActions([open_act, save_act])
-        
+        save_act.setShortcut("Ctrl+S")
+        save_act.triggered.connect(self._on_save_session)
+        file_menu.addAction(save_act)
+
+        file_menu.addSeparator()
+
+        undo_act = QAction("Undo", self)
+        undo_act.setShortcut("Ctrl+Z")
+        undo_act.triggered.connect(self.undo_stack.undo)
+        file_menu.addAction(undo_act)
+
+        redo_act = QAction("Redo", self)
+        redo_act.setShortcut("Ctrl+Y")
+        redo_act.triggered.connect(self.undo_stack.redo)
+        file_menu.addAction(redo_act)
+
         export_menu = menu.addMenu("Export")
         export_gc = QAction("Export G-Code...", self)
+        export_gc.setShortcut("Ctrl+E")
         export_gc.triggered.connect(self._on_export)
-        export_menu.addActions([export_gc])
+        export_menu.addAction(export_gc)
 
     def _build_ui(self):
         central = QWidget()
@@ -1477,29 +1587,66 @@ class PlotterStudio(QMainWindow):
         layout.setSpacing(6)
 
         # --- Plotter Studio title ---
-        title = QLabel("Plotter Studio")
+        title = QLabel("Plotter Studio v2.0")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff; padding-bottom: 2px;")
         layout.addWidget(title)
 
+        # --- Style Presets -----------------------------------------
+        preset_hdr = QLabel("Style Preset")
+        preset_hdr.setStyleSheet("font-size: 11px; font-weight: bold; color: #888; padding-top: 6px;")
+        layout.addWidget(preset_hdr)
+
+        preset_combo_row = QHBoxLayout()
+        self.combo_preset = QComboBox()
+        self.combo_preset.setStyleSheet("""
+            QComboBox {
+                background-color: #3c3f41; color: #e0e0e0; border: 1px solid #555;
+                border-radius: 4px; padding: 5px 8px; font-size: 13px; font-weight: bold;
+            }
+            QComboBox::drop-down { border: none; width: 20px; }
+            QComboBox QAbstractItemView {
+                background-color: #2d2d30; color: #e0e0e0;
+                selection-background-color: #094771;
+            }
+        """)
+        for name in STYLE_PRESETS:
+            self.combo_preset.addItem(name)
+        self.combo_preset.setCurrentText("📝 Normal")
+        self.combo_preset.currentTextChanged.connect(self._apply_preset)
+        preset_combo_row.addWidget(self.combo_preset, 1)
+
+        btn_add_block = QPushButton("＋ Add Block")
+        btn_add_block.setFixedHeight(36)
+        btn_add_block.setStyleSheet("""
+            QPushButton {
+                background-color: #0e639c; color: white; font-weight: bold;
+                border-radius: 5px; padding: 4px 10px; font-size: 12px;
+            }
+            QPushButton:hover { background-color: #1177bb; }
+        """)
+        btn_add_block.clicked.connect(self._on_add_block)
+        preset_combo_row.addWidget(btn_add_block)
+        layout.addLayout(preset_combo_row)
+
         # --- Synthesis Parameters header ---
         synth_hdr = QLabel("Synthesis Parameters")
-        synth_hdr.setStyleSheet("font-size: 13px; font-weight: bold; color: #aaaaaa; padding-top: 4px;")
+        synth_hdr.setStyleSheet("font-size: 11px; font-weight: bold; color: #888; padding-top: 6px;")
         layout.addWidget(synth_hdr)
 
         # Sliders
-        self.slider_bias = DecimalSlider("Bias / Sloppiness", 0.10, 1.20, 1.00, decimals=2)
+        self.slider_bias = DecimalSlider("Bias / Sloppiness", 0.10, 2.00, 1.00, decimals=2)
         self.slider_scale = DecimalSlider("Text Scale", 0.005, 0.100, 0.015, decimals=3)
         self.slider_spacing = DecimalSlider("Line Spacing (mm)", 2.00, 60.00, 10.00, decimals=2)
         self.slider_word = DecimalSlider("Word Spacing (mm)", 1.0, 20.0, 5.0, decimals=1)
         self.slider_blk_width = DecimalSlider("Block Width (mm)", 30.0, 300.0, 190.0, decimals=1)
-        self.slider_randomness = DecimalSlider("Randomness", 0.00, 5.00, 1.00, decimals=2)
+        self.slider_min_chunk = DecimalSlider("Min Phrase (chars)", 4.0, 30.0, 8.0, decimals=0)
 
         layout.addWidget(self.slider_bias)
         layout.addWidget(self.slider_scale)
         layout.addWidget(self.slider_spacing)
         layout.addWidget(self.slider_word)
         layout.addWidget(self.slider_blk_width)
-        layout.addWidget(self.slider_randomness)
+        layout.addWidget(self.slider_min_chunk)
 
         # --- Hardware / G-Code ---
         hw_group = QGroupBox("Hardware / G-Code")
@@ -1655,14 +1802,30 @@ class PlotterStudio(QMainWindow):
     def _create_and_place_block(self, text):
         scale = max(0.001, self.slider_scale.value())
         stochastic = True
-        
-        block = HandwritingBlock(text, scale, self.slider_spacing.value(), self.slider_blk_width.value())
+
+        block = HandwritingBlock(
+            text, scale,
+            line_spacing=self.slider_spacing.value(),
+            block_width=self.slider_blk_width.value(),
+            word_spacing=self.slider_word.value(),
+        )
         block.signals.regenerate_requested.connect(self._on_regenerate_block)
         block.signals.delete_requested.connect(self._on_delete_block)
-        
+        block.signals.edit_requested.connect(self._on_edit_block)
+
         block.setPos(20, 20 if not self._blocks else self._blocks[-1].scenePos().y() + 40)
         self.undo_stack.push(AddBlockCommand(self.scene, block, self._blocks))
         self._run_synthesis_worker(block, stochastic)
+
+    def _on_edit_block(self, block):
+        dlg = AddBlockDialog(self, initial_text=block.source_text)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_text = dlg.get_text()
+        if not new_text:
+            return
+        block.source_text = new_text
+        self._run_synthesis_worker(block, stochastic=True)
 
     def _on_regenerate_block(self, block):
         stochastic = True
@@ -1673,28 +1836,175 @@ class PlotterStudio(QMainWindow):
 
     def _run_synthesis_worker(self, block, stochastic):
         ai_review = self.chk_ai_review.isChecked()
-        review_threshold = 0.5
-        review_retries = 3
+        # Read actual UI values
+        review_threshold = self.slider_quality.value()
+        review_retries = self.spin_max_retries.value()
+        min_chunk = max(4, int(self.slider_min_chunk.value()))
 
-        tokens = HandwritingBlock._tokenize(block.source_text)
+        # Update engine bias when slider changes
+        self.engine.set_bias(self.slider_bias.value())
+
+        tokens = HandwritingBlock._tokenize(block.source_text, min_chunk_chars=min_chunk)
         self._worker = SynthesisWorker(
-            block, self.engine, tokens, block.scale_param, 
+            block, self.engine, tokens, block.scale_param,
             stochastic, ai_review, review_threshold, review_retries
         )
         self._worker.log_msg.connect(self.review_panel.append)
+        self._worker.chunk_ready.connect(self._on_worker_status)
+        self._worker.error.connect(self._on_worker_error)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+
+    def _on_worker_status(self, msg: str):
+        self.statusBar().showMessage(msg, 4000)
+
+    def _on_worker_error(self, msg: str):
+        QMessageBox.critical(self, "Synthesis Error", msg)
+        self.statusBar().showMessage(f"Error: {msg}", 8000)
 
     def _on_worker_finished(self, block, stroke_data):
         block.apply_stroke_data(stroke_data)
         block.update()
+        self.statusBar().showMessage("Synthesis complete.", 3000)
 
     def _on_export(self):
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(self, "Export", "Detailed G-Code generation ready.")
+        all_strokes = []
+        for blk in self._blocks:
+            all_strokes.extend(blk.get_strokes_in_scene())
+
+        if not all_strokes:
+            QMessageBox.warning(self, "Export", "No strokes to export. Add a block first.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export G-Code", "output.gcode",
+            "G-Code (*.gcode *.nc);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            draw_speed  = int(self.input_draw_speed.text() or "1500")
+        except ValueError:
+            draw_speed = 1500
+        try:
+            move_speed  = int(self.input_move_speed.text() or "3000")
+        except ValueError:
+            move_speed = 3000
+
+        pen_down = self.input_pen_down.text() or "M3 S90"
+        pen_up   = self.input_pen_up.text()   or "M3 S0"
+        flip     = self.chk_flip_axes.isChecked()
+
+        lines = self.engine.compile_gcode(
+            all_strokes,
+            pen_up_cmd=pen_up, pen_down_cmd=pen_down,
+            draw_speed=draw_speed, rapid_speed=move_speed,
+            flip_axes=flip,
+        )
+
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+
+        QMessageBox.information(self, "Export G-Code",
+                                f"{len(lines)} lines written to:\n{path}")
+        self.statusBar().showMessage(f"Exported {len(lines)} G-code lines.", 5000)
+
+    # ------------------------------------------------------------------
+    # Session save / load
+    # ------------------------------------------------------------------
+    def _on_save_session(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Session", "session.pstudio",
+            "Plotter Studio Session (*.pstudio);;All Files (*)"
+        )
+        if not path:
+            return
+
+        data = {"blocks": []}
+        for blk in self._blocks:
+            pos = blk.scenePos()
+            blk_data = {
+                "text":          blk.source_text,
+                "x":             pos.x(),
+                "y":             pos.y(),
+                "scale":         blk.scale_param,
+                "line_spacing":  blk.line_spacing,
+                "block_width":   blk.block_width,
+                "word_spacing":  blk.word_spacing,
+                # Embed stroke data so reload is instant (no re-synthesis needed)
+                "stroke_data": [
+                    [itm[0],
+                     [[list(pt) for pt in stroke] for stroke in itm[1]],
+                     list(itm[2]),
+                     itm[3] if len(itm) > 3 else 0]
+                    for itm in blk._stroke_data
+                ],
+            }
+            data["blocks"].append(blk_data)
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.statusBar().showMessage(f"Session saved → {path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    def _on_open_session(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Session", "",
+            "Plotter Studio Session (*.pstudio);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Error", str(e))
+            return
+
+        # Clear existing blocks
+        for blk in list(self._blocks):
+            self.scene.removeItem(blk)
+        self._blocks.clear()
+        self.undo_stack.clear()
+
+        for bd in data.get("blocks", []):
+            blk = HandwritingBlock(
+                bd["text"],
+                bd.get("scale", 0.015),
+                line_spacing=bd.get("line_spacing", 10.0),
+                block_width=bd.get("block_width", 170.0),
+                word_spacing=bd.get("word_spacing", 5.0),
+            )
+            blk.signals.regenerate_requested.connect(self._on_regenerate_block)
+            blk.signals.delete_requested.connect(self._on_delete_block)
+            blk.signals.edit_requested.connect(self._on_edit_block)
+
+            self.scene.addItem(blk)
+            self._blocks.append(blk)
+            blk.setPos(bd.get("x", 20), bd.get("y", 20))
+
+            raw_sd = bd.get("stroke_data", [])
+            if raw_sd:
+                stroke_data = []
+                for item in raw_sd:
+                    text  = item[0]
+                    strks = [list(map(tuple, s)) for s in item[1]]
+                    bbox  = tuple(item[2])
+                    tries = item[3] if len(item) > 3 else 0
+                    stroke_data.append((text, strks, bbox, tries))
+                blk.apply_stroke_data(stroke_data)
+            else:
+                self._run_synthesis_worker(blk, stochastic=True)
+
+        self.statusBar().showMessage(f"Session loaded: {len(self._blocks)} blocks.", 5000)
 
 
 def main():
+
     from PyQt6.QtWidgets import QApplication
     import sys
     app = QApplication.instance()
