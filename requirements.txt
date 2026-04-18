@@ -6,3 +6,4 @@ torchvision
 requests
 h5py
 svgwrite
+svgelements

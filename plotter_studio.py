@@ -13,6 +13,7 @@
 # === CRITICAL IMPORT ORDER: PyTorch FIRST, then PyQt6 ===
 import torch
 from handwriting_synthesis.sampling import HandwritingSynthesizer as CoreSynthesizer
+from svg_block import SvgBlock
 
 import sys
 import os
@@ -1631,6 +1632,18 @@ class PlotterStudio(QMainWindow):
         """)
         btn_add_block.clicked.connect(self._on_add_block)
         preset_combo_row.addWidget(btn_add_block)
+        
+        btn_add_svg = QPushButton("🎨 Add SVG")
+        btn_add_svg.setFixedHeight(36)
+        btn_add_svg.setStyleSheet("""
+            QPushButton {
+                background-color: #0c7b5a; color: white; font-weight: bold;
+                border-radius: 5px; padding: 4px 10px; font-size: 12px;
+            }
+            QPushButton:hover { background-color: #119970; }
+        """)
+        btn_add_svg.clicked.connect(self._on_add_svg)
+        preset_combo_row.addWidget(btn_add_svg)
         layout.addLayout(preset_combo_row)
 
         # --- Synthesis Parameters header ---
@@ -1816,6 +1829,22 @@ class PlotterStudio(QMainWindow):
         if not text: return
         self._create_and_place_block(text)
 
+    def _on_add_svg(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open SVG Graphic", "",
+            "SVG Files (*.svg);;All Files (*)"
+        )
+        if not path:
+            return
+            
+        try:
+            block = SvgBlock(path, target_width=self.slider_blk_width.value())
+            block.signals.delete_requested.connect(self._on_delete_block)
+            block.setPos(20, 20 if not self._blocks else self._blocks[-1].scenePos().y() + 40)
+            self.undo_stack.push(AddBlockCommand(self.scene, block, self._blocks))
+        except Exception as e:
+            QMessageBox.critical(self, "SVG Import Error", f"Failed to parse SVG:\n{str(e)}")
+
     def _create_and_place_block(self, text):
         scale = max(0.001, self.slider_scale.value())
         stochastic = True
@@ -1942,6 +1971,10 @@ class PlotterStudio(QMainWindow):
 
         data = {"blocks": []}
         for blk in self._blocks:
+            if hasattr(blk, 'to_dict'):
+                data["blocks"].append(blk.to_dict())
+                continue
+                
             pos = blk.scenePos()
             blk_data = {
                 "text":          blk.source_text,
@@ -1991,6 +2024,17 @@ class PlotterStudio(QMainWindow):
         self.undo_stack.clear()
 
         for bd in data.get("blocks", []):
+            if bd.get("type") == "svg":
+                try:
+                    blk = SvgBlock.from_dict(bd)
+                    blk.signals.delete_requested.connect(self._on_delete_block)
+                    self.scene.addItem(blk)
+                    self._blocks.append(blk)
+                    blk.setPos(bd.get("x", 20), bd.get("y", 20))
+                except Exception as e:
+                    self.statusBar().showMessage(f"Failed to load SVG: {e}", 5000)
+                continue
+
             blk = HandwritingBlock(
                 bd["text"],
                 bd.get("scale", 0.015),
