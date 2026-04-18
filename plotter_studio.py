@@ -1590,7 +1590,7 @@ class PlotterStudio(QMainWindow):
     def _build_control_panel(self):
         from PyQt6.QtWidgets import QSpinBox, QScrollArea
         panel = QWidget()
-        panel.setFixedWidth(310)
+        panel.setMinimumWidth(250)
         panel.setStyleSheet("background-color: #252526; border-right: 1px solid #3e3e42;")
 
         scroll = QScrollArea()
