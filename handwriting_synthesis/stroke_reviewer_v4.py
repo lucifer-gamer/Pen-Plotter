@@ -199,95 +199,99 @@ def _topology_analysis(text: str, strokes: list, bbox: tuple,
     """
     Text-aware topology sub-score (zone-based with absolute reference).
 
-    Uses the block's median_height as the expected body height to define
-    absolute zone boundaries, rather than the chunk's own bounding box.
-    This way, a chunk missing its descender will have a shorter bbox than
-    expected, and the descender zone won't be reached by any ink.
+    Three key calibrations vs earlier versions:
+      1. Zone boundaries at ±0.30 * median_height (was 0.45 — too wide,
+         swallowed real ascenders/descenders into the body zone).
+      2. Required ink fractions scale with the PROPORTION of asc/desc
+         characters in the text.  "improve realism" (1 desc in 14 chars)
+         needs much less descender-zone ink than "gypsy" (3 desc in 5).
+      3. Penalty floor of 0.65 — topology can reduce a score by at most
+         35%, preventing it from permanently blocking well-rendered chunks
+         that the RNN produces slightly differently than our zone model.
 
-    Zones (relative to the chunk's vertical center):
-      - Ascender zone:  y < center - median_height * 0.55
-      - Body zone:      between ascender and descender
-      - Descender zone: y > center + median_height * 0.55
-
-    Returns 0.0 to 1.0.
+    Returns 0.65 to 1.0 (floored).
     """
     if not strokes or not text.strip():
-        return 0.0
+        return 1.0  # No penalty when we can't analyse
 
     core = text.strip().lower()
+    # Only count alphabetic characters for proportion calculation
+    alpha_chars = [c for c in core if c.isalpha()]
+    n_alpha = len(alpha_chars)
+    if n_alpha == 0:
+        return 1.0  # Punctuation-only — no topology expectation
+
     min_y = bbox[1]
     max_y = bbox[3]
     h = max_y - min_y
     if h < 0.01 or median_height < 0.01:
-        return 0.0
+        return 1.0
 
-    has_ascenders = any(c in ASCENDERS for c in core)
-    has_descenders = any(c in DESCENDERS for c in core)
+    n_asc = sum(1 for c in alpha_chars if c in ASCENDERS)
+    n_desc = sum(1 for c in alpha_chars if c in DESCENDERS)
+    has_ascenders = n_asc > 0
+    has_descenders = n_desc > 0
+    frac_asc_chars = n_asc / n_alpha   # e.g., 1/14 = 0.07
+    frac_desc_chars = n_desc / n_alpha
 
     # Collect all Y values
     all_ys = [y for s in strokes for _, y in s]
     n = len(all_ys)
     if n < 2:
-        return 0.0
+        return 1.0
 
-    # Use the median of all Y as the vertical center of the body
+    # Vertical center of the ink mass
     all_ys_sorted = sorted(all_ys)
     center_y = all_ys_sorted[n // 2]
 
-    # Zone boundaries based on the block's median height (absolute reference)
-    # Body zone is centered on center_y, spanning ±0.45 * median_height
-    body_half = median_height * 0.45
-    asc_boundary = center_y - body_half      # above this = ascender zone
-    desc_boundary = center_y + body_half     # below this = descender zone
+    # Zone boundaries — narrower than before (0.30 not 0.45)
+    body_half = median_height * 0.30
+    asc_boundary = center_y - body_half
+    desc_boundary = center_y + body_half
 
     # Count points in each zone
     pts_asc = sum(1 for y in all_ys if y < asc_boundary)
     pts_desc = sum(1 for y in all_ys if y > desc_boundary)
-    frac_asc = pts_asc / n
-    frac_desc = pts_desc / n
+    frac_ink_asc = pts_asc / n
+    frac_ink_desc = pts_desc / n
 
     score = 1.0
 
-    # --- Descender validation ---
+    # --- Descender validation (proportion-scaled) ---
     if has_descenders:
-        # Text requires descenders: ink must reach the descender zone
-        if frac_desc < 0.02:
-            score *= 0.25   # Descender completely absent
-        elif frac_desc < 0.05:
-            score *= 0.60   # Stunted descender
-    else:
-        # No descenders expected: penalise ink leaking into descender zone
-        if frac_desc > 0.15:
-            score *= 0.50
-        elif frac_desc > 0.10:
+        # Scale required ink fraction by proportion of descender chars
+        # "gypsy" (60% desc chars) needs more ink below than "improve" (7%)
+        required = 0.01 + 0.04 * frac_desc_chars  # 0.01 to 0.05
+        if frac_ink_desc < required * 0.3:
             score *= 0.75
-
-    # --- Ascender validation ---
-    if has_ascenders:
-        if frac_asc < 0.02:
-            score *= 0.30   # Ascender missing
-        elif frac_asc < 0.05:
-            score *= 0.65   # Stunted ascender
+        elif frac_ink_desc < required:
+            score *= 0.85
     else:
-        if frac_asc > 0.15:
-            score *= 0.55
-        elif frac_asc > 0.10:
+        # No descenders: penalise only heavy leaking
+        if frac_ink_desc > 0.20:
             score *= 0.80
 
-    # --- Height plausibility (text-aware) ---
-    if has_ascenders and has_descenders:
-        # Text like "dog" should be taller than body-only text
-        if h < median_height * 0.9:
-            score *= 0.55   # suspiciously compact for asc+desc text
-    elif has_ascenders or has_descenders:
-        if h < median_height * 0.7:
-            score *= 0.65   # somewhat short for text needing asc or desc
+    # --- Ascender validation (proportion-scaled) ---
+    if has_ascenders:
+        required = 0.01 + 0.04 * frac_asc_chars
+        if frac_ink_asc < required * 0.3:
+            score *= 0.75
+        elif frac_ink_asc < required:
+            score *= 0.85
     else:
-        # Pure x-height text should be compact
-        if h > median_height * 2.2:
-            score *= 0.55
+        if frac_ink_asc > 0.20:
+            score *= 0.80
 
-    return max(0.0, min(1.0, score))
+    # --- Height plausibility (only when asc/desc chars are >25% of text) ---
+    if has_ascenders and has_descenders and (frac_asc_chars + frac_desc_chars) > 0.25:
+        if h < median_height * 0.7:
+            score *= 0.80
+    elif not has_ascenders and not has_descenders:
+        if h > median_height * 2.5:
+            score *= 0.80
+
+    # Floor: topology can never reduce score by more than 35%
+    return max(0.65, min(1.0, score))
 
 
 
