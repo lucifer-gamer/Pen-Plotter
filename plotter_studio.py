@@ -1387,12 +1387,22 @@ class ReviewPanel(QDockWidget):
         clear_btn.setStyleSheet("background-color: #3e3e42; color: #d4d4d4; border-radius: 3px; padding: 4px 15px;")
         clear_btn.clicked.connect(self.clear)
 
-        toolbar.addWidget(self._total_regen_label)
-        toolbar.addWidget(self._avg_retries_label)
+        toolbar = QVBoxLayout()
+        toolbar.setSpacing(6)
+
+        stats_row = QHBoxLayout()
+        stats_row.addWidget(self._total_regen_label)
+        stats_row.addWidget(self._avg_retries_label)
+        stats_row.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(clear_btn)
+
+        toolbar.addLayout(stats_row)
         toolbar.addLayout(legend_row)
-        toolbar.addStretch()
-        toolbar.addWidget(copy_btn)
-        toolbar.addWidget(clear_btn)
+        toolbar.addLayout(btn_row)
         layout.addLayout(toolbar)
 
         self._log_edit = QTextEdit()
@@ -1574,7 +1584,8 @@ class PlotterStudio(QMainWindow):
         root_layout.addWidget(splitter)
         
         self.review_panel = ReviewPanel(self)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.review_panel)
+        self.review_panel.setMinimumWidth(380)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.review_panel)
 
     def _build_control_panel(self):
         from PyQt6.QtWidgets import QSpinBox, QScrollArea
