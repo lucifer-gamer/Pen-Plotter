@@ -13,7 +13,6 @@
 # === CRITICAL IMPORT ORDER: PyTorch FIRST, then PyQt6 ===
 import torch
 from handwriting_synthesis.sampling import HandwritingSynthesizer as CoreSynthesizer
-from handwriting_synthesis.stroke_reviewer_v4 import StrokeReviewer
 
 import sys
 import os
@@ -652,7 +651,7 @@ class SynthesisWorker(QThread):
     finished = pyqtSignal(object, list)
     error = pyqtSignal(str)
 
-    def __init__(self, block, engine, tokens, scale_param, stochastic, ai_review, review_threshold, review_retries):
+    def __init__(self, block, engine, tokens, scale_param, stochastic, ai_review, ai_version, review_threshold, review_retries):
         super().__init__()
         self.block = block
         self.engine = engine
@@ -660,6 +659,7 @@ class SynthesisWorker(QThread):
         self.scale_param = scale_param
         self.stochastic = stochastic
         self.ai_review = ai_review
+        self.ai_version = ai_version
         self.review_threshold = review_threshold
         self.review_retries = review_retries
 
@@ -735,7 +735,12 @@ class SynthesisWorker(QThread):
                 stroke_data.append((token, strokes, bbox, 0))
 
             if self.ai_review and stroke_data:
-                reviewer = StrokeReviewer(
+                if self.ai_version == 3:
+                    from handwriting_synthesis.stroke_reviewer import StrokeReviewer as ReviewerClass
+                else:
+                    from handwriting_synthesis.stroke_reviewer_v4 import StrokeReviewer as ReviewerClass
+                    
+                reviewer = ReviewerClass(
                     threshold=self.review_threshold,
                     max_retries=self.review_retries,
                 )
@@ -1694,6 +1699,18 @@ class PlotterStudio(QMainWindow):
         self.chk_ai_review.setStyleSheet("color: #e0e0e0; font-weight: bold; font-size: 12px;")
         ai_layout.addWidget(self.chk_ai_review)
 
+        self.combo_ai_version = QComboBox()
+        self.combo_ai_version.addItems(["v4 (Text-Aware / Strict)", "v3 (Stable Geometric)"])
+        self.combo_ai_version.setStyleSheet("""
+            QComboBox {
+                background-color: #3c3f41; border: 1px solid #555;
+                margin-top: 4px; margin-bottom: 4px;
+                border-radius: 3px; padding: 2px 8px; color: #e0e0e0; font-size: 11px;
+            }
+            QComboBox::drop-down { border: none; }
+        """)
+        ai_layout.addWidget(self.combo_ai_version)
+
         ai_desc = QLabel("Auto-detects and retries bad chunks\n(dots, collapses, runaway sequences)")
         ai_desc.setStyleSheet("color: #888; font-size: 10px;")
         ai_desc.setWordWrap(True)
@@ -1836,6 +1853,8 @@ class PlotterStudio(QMainWindow):
 
     def _run_synthesis_worker(self, block, stochastic):
         ai_review = self.chk_ai_review.isChecked()
+        ai_version = 4 if "v4" in self.combo_ai_version.currentText().lower() else 3
+        
         # Read actual UI values
         review_threshold = self.slider_quality.value()
         review_retries = self.spin_max_retries.value()
@@ -1847,7 +1866,7 @@ class PlotterStudio(QMainWindow):
         tokens = HandwritingBlock._tokenize(block.source_text, min_chunk_chars=min_chunk)
         self._worker = SynthesisWorker(
             block, self.engine, tokens, block.scale_param,
-            stochastic, ai_review, review_threshold, review_retries
+            stochastic, ai_review, ai_version, review_threshold, review_retries
         )
         self._worker.log_msg.connect(self.review_panel.append)
         self._worker.chunk_ready.connect(self._on_worker_status)
