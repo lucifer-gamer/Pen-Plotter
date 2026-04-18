@@ -77,7 +77,7 @@ WEIGHTS: dict[str, float] = {
 assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9, f"Weights must sum to 1.0, got {sum(WEIGHTS.values())}"
 
 # Multiplicative penalty keys (not additive — these only reduce the core score)
-PENALTY_KEYS = ("topology", "density")
+PENALTY_KEYS = ("topology", "density", "uniformity")
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +290,8 @@ def _topology_analysis(text: str, strokes: list, bbox: tuple,
         if h > median_height * 2.5:
             score *= 0.80
 
-    # Floor: topology can never reduce score by more than 35%
-    return max(0.65, min(1.0, score))
+    # Floor: topology can reduce score by at most 42% (floor raised from 0.65 → 0.58)
+    return max(0.58, min(1.0, score))
 
 
 
@@ -355,6 +355,61 @@ def _ink_density_score(strokes: list, bbox: tuple, grid_size: int = 8) -> float:
         return 0.30   # Very sparse — likely just a dot or short scrawl
     if coverage < 0.15:
         return 0.60
+
+    return 1.0
+
+
+def _horizontal_uniformity(strokes: list, bbox: tuple, char_count: int) -> float:
+    """
+    Horizontal ink distribution check — detects sequence collapses.
+
+    Sequence collapses cram characters into one region while leaving the
+    rest of the expected horizontal span nearly empty.  Normal cursive
+    distributes ink roughly evenly across the full width.
+
+    Returns 0.60..1.0 (multiplicative penalty — can only reduce score).
+    """
+    min_x, _, max_x, _ = bbox
+    w = max_x - min_x
+    if w < 0.01 or char_count <= 2:
+        return 1.0
+
+    n_bins = min(max(3, char_count), 8)
+    bins = [0] * n_bins
+    total = 0
+
+    for stroke in strokes:
+        for x, y in stroke:
+            seg = int((x - min_x) / w * n_bins)
+            seg = max(0, min(n_bins - 1, seg))
+            bins[seg] += 1
+            total += 1
+
+    if total == 0:
+        return 0.60
+
+    fracs = [b / total for b in bins]
+    expected = 1.0 / n_bins
+
+    # Inner gap check — middle segments nearly empty = strong collapse signal
+    if n_bins >= 4:
+        inner = fracs[1:-1]
+        very_sparse = sum(1 for f in inner if f < expected * 0.12)
+        if very_sparse >= 2:
+            return 0.60  # Multiple inner gaps
+        if very_sparse >= 1:
+            return 0.78  # Single inner gap
+
+    # Coefficient of variation (how uneven is the distribution?)
+    mean = sum(fracs) / len(fracs)
+    variance = sum((f - mean) ** 2 for f in fracs) / len(fracs)
+    std = math.sqrt(variance)
+    cv = std / mean if mean > 0 else 0.0
+
+    if cv > 1.8:    # Very uneven
+        return 0.65
+    if cv > 1.2:    # Moderately uneven
+        return 0.83
 
     return 1.0
 
@@ -450,6 +505,14 @@ def _arc_sub_score(arc: float, expected_arc: float) -> float:
     if expected_arc <= 0:
         return 1.0
     ratio = arc / expected_arc
+    # ── Upper ceiling: excess ink = RNN runaway / attention loop ──
+    if ratio > 4.0:
+        return 0.05
+    if ratio > 2.5:
+        return 0.35
+    if ratio > 1.8:
+        return 0.75  # Slightly over — mild penalty
+    # ── Normal range ──
     if ratio >= 0.80:
         return 1.0
     if ratio >= 0.60:
@@ -462,8 +525,9 @@ def _arc_sub_score(arc: float, expected_arc: float) -> float:
 
 
 def _x_mono_sub_score(mono: float, ref_mono: float) -> float:
-    lo = max(0.45, ref_mono - 0.15)
-    hi = min(0.92, ref_mono + 0.15)
+    # Tightened band: ±0.12 instead of ±0.15 — reduces false-pass zone
+    lo = max(0.47, ref_mono - 0.12)
+    hi = min(0.91, ref_mono + 0.12)
 
     if lo <= mono <= hi:
         return 1.0
@@ -471,25 +535,32 @@ def _x_mono_sub_score(mono: float, ref_mono: float) -> float:
         gap = lo - mono
         if gap < 0.08:
             return 0.70
-        if gap < 0.15:
+        if gap < 0.14:
             return 0.35
         return 0.0
     gap = mono - hi
     if gap < 0.08:
         return 0.80
-    if gap < 0.15:
+    if gap < 0.14:
         return 0.45
     return 0.10
 
 
 def _extrema_sub_score(extrema_per_char: float) -> float:
-    if extrema_per_char >= 1.1:
+    # ── Upper ceiling: too many direction changes = sequence collapse ──
+    # Normal cursive: 1.0–2.8 extrema/char.  Collapse: >3.5 (random chaotic loops)
+    if extrema_per_char > 4.5:
+        return 0.10   # Extreme chaos
+    if extrema_per_char > 3.0:
+        return 0.50   # Suspicious oscillation
+    # ── Normal range ──
+    if extrema_per_char >= 1.0:   # Was 1.1
         return 1.0
-    if extrema_per_char >= 0.9:
+    if extrema_per_char >= 0.85:  # Was 0.9
         return 0.82
-    if extrema_per_char >= 0.7:
+    if extrema_per_char >= 0.65:  # Was 0.7
         return 0.50
-    if extrema_per_char >= 0.4:
+    if extrema_per_char >= 0.35:  # Was 0.4
         return 0.20
     return 0.0
 
@@ -516,13 +587,14 @@ def _width_sub_score(w: float, expected_w: float) -> float:
     if expected_w <= 0:
         return 1.0
     ratio = w / expected_w
-    if 0.80 <= ratio <= 1.60:
+    # ── Tightened upper bound: 1.45× (was 1.60) ──
+    if 0.78 <= ratio <= 1.45:
         return 1.0
-    if ratio > 1.60:
-        if ratio < 2.2:
-            return 0.60
-        if ratio < 3.0:
-            return 0.20
+    if ratio > 1.45:
+        if ratio < 2.0:    # Was < 2.2
+            return 0.55
+        if ratio < 2.8:    # Was < 3.0
+            return 0.18
         return 0.0
     if ratio >= 0.60:
         return 0.65
@@ -598,8 +670,9 @@ def score_chunk(text: str, strokes: list, bbox: tuple, stats: BlockStats) -> flo
     # --- V4 multiplicative penalties ---
     topo_s = _topology_analysis(text, strokes, bbox, stats.median_height)
     dens_s = _ink_density_score(strokes, bbox)
+    unif_s = _horizontal_uniformity(strokes, bbox, char_count)
 
-    final = core_score * topo_s * dens_s
+    final = core_score * topo_s * dens_s * unif_s
     return max(0.0, min(1.0, final))
 
 
@@ -641,6 +714,7 @@ def score_chunk_detailed(
 
     topo_s = _topology_analysis(text, strokes, bbox, stats.median_height)
     dens_s = _ink_density_score(strokes, bbox)
+    unif_s = _horizontal_uniformity(strokes, bbox, char_count)
 
     # Build sub-scores dict (core + penalties)
     subs = {}
@@ -648,11 +722,12 @@ def score_chunk_detailed(
         subs[key] = val
     subs["topology"] = topo_s
     subs["density"] = dens_s
+    subs["uniformity"] = unif_s
 
     # Core score (V3-identical)
     core_score = sum(subs[k] * WEIGHTS[k] for k in WEIGHTS)
     # Multiplicative penalties
-    final = core_score * topo_s * dens_s
+    final = core_score * topo_s * dens_s * unif_s
     final = max(0.0, min(1.0, final))
     return final, subs
 
@@ -706,6 +781,22 @@ def _score_reasons(text: str, strokes: list, bbox: tuple, stats: BlockStats) -> 
 
     if subs["density"] < 0.5:
         reasons.append(f"inkpool={subs['density']:.2f}")
+
+    if subs.get("uniformity", 1.0) < 0.85:
+        reasons.append(f"unif={subs['uniformity']:.2f}")
+
+    # Also flag extrema ceiling violations (chaos indicator)
+    hysteresis2 = max(0.4, stats.median_height * 0.12 + 0.02 * char_count)
+    ext_pc2 = _y_extrema(strokes, hysteresis2) / char_count
+    if ext_pc2 > 3.0 and subs["extrema"] < 0.8:
+        reasons.append(f"chaos(ext={ext_pc2:.1f}/c)")
+
+    # Flag arc runaway
+    arc2 = _arc_length(strokes)
+    expected_arc2 = stats.expected_arc(text)
+    arc_ratio2 = arc2 / expected_arc2 if expected_arc2 > 0 else 1.0
+    if arc_ratio2 > 1.8 and subs["arc"] < 1.0:
+        reasons.append(f"arc_high={arc_ratio2:.1f}x")
 
     return ", ".join(reasons) if reasons else "ok"
 
